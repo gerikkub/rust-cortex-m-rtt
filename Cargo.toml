@@ -1,0 +1,12 @@
+[package]
+name = "rtt"
+version = "0.1.0"
+authors = ["Gerik Kubiak <gerikkub@gmail.com>"]
+edition = "2018"
+
+[dependencies.cortex-m]
+version = "0.5.6"
+
+[dependencies.cortex-m-rt]
+version = "0.5.3"
+
