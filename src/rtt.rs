@@ -8,11 +8,14 @@
 //use core::option::Option;
 
 use core::cell::RefCell;
-use core::ptr::{write_volatile, read_volatile};
+use core::ptr::{write_volatile, read_volatile, copy_nonoverlapping};
 use core::marker::Send;
 
 use cortex_m::interrupt;
 use cortex_m::interrupt::Mutex;
+use cortex_m::asm;
+
+use core::fmt::{self, Write};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -99,13 +102,17 @@ impl RTTCB {
     }
 }
 
-//static mut RTTUpBufferMem: [u8; 256] = [0; 256];
-//static mut RTTDownBufferMem: [u8; 256] = [0; 256];
-
 static RTTUpBuffer: Mutex<RefCell<[u8; 256]>> = Mutex::new(RefCell::new([0; 256]));
 static RTTDownBuffer: Mutex<RefCell<[u8; 256]>> = Mutex::new(RefCell::new([0; 256]));
 
 static RTTCb: Mutex<RefCell<RTTCB>> = Mutex::new(RefCell::new(RTTCB::newConst()));
+
+pub struct RTT {
+}
+
+pub fn get_chan(chan: usize) -> RTT {
+    RTT {}
+}
 
 pub fn init() {
 
@@ -131,6 +138,83 @@ pub fn init() {
     });
 }
 
+impl fmt::Write for RTT {
+    fn write_str(&mut self, s: &str) -> fmt::Result{
+
+        interrupt::free(|cs|
+        {
+            let mut cb = RTTCb.borrow(cs).borrow_mut();
+
+            let size = cb.up.size as usize;
+            let wr_offset = unsafe { read_volatile(&cb.up.wr_off) } as usize;
+            let rd_offset = unsafe { read_volatile(&cb.up.rd_off) } as usize;
+
+            let mut space_left = 0;
+
+            if wr_offset == rd_offset {
+                space_left = size;
+            } else if wr_offset > rd_offset {
+                space_left = size - (wr_offset - rd_offset);
+            } else {
+                space_left = rd_offset - wr_offset;
+            }
+
+            // Get the wriable potions of the string based on
+            // space remaining in the circular buffer
+            let mut writeable_str = "";
+
+            if space_left >= s.len() {
+                writeable_str = s;
+            } else {
+                writeable_str = &s[..space_left]
+            }
+
+            let wrap_idx = (size - wr_offset) as usize;
+
+            let mut left_str = "";
+            let mut right_str = "";
+
+            if wrap_idx >= writeable_str.len() {
+                left_str = &writeable_str;
+            } else {
+                let (left_str, right_str) = writeable_str.split_at(wrap_idx);
+            }
+
+            let mut upBuffer = &mut (*RTTUpBuffer.borrow(cs).borrow_mut());
+            // Write Left String
+            if left_str.len() > 0 {
+                let dataPtr = &mut upBuffer[wr_offset];
+
+                unsafe {
+                    copy_nonoverlapping(left_str.as_ptr(), dataPtr as *mut u8, left_str.len());
+                }
+            }
+
+            // Write Right String
+            if right_str.len() > 0 {
+                let dataPtr = &mut upBuffer[0];
+
+                unsafe {
+                    copy_nonoverlapping(right_str.as_ptr(), dataPtr as *mut u8, right_str.len());
+                }
+            }
+
+            let offset_ref_mut = &mut cb.up.wr_off;
+            let new_offset = (wr_offset + s.len()) % size;
+
+            // Ensure all buffer writes occur before updating index
+            asm::dmb();
+
+            unsafe {
+                write_volatile(offset_ref_mut, new_offset as u32);
+            }
+        });
+
+        Ok(())
+    }
+
+}
+
 pub fn write_byte(b: u8) {
 
     interrupt::free(|cs|
@@ -149,6 +233,8 @@ pub fn write_byte(b: u8) {
             unsafe {
                 write_volatile(dataPtr, b);
             }
+
+            asm::dmb();
         }
 
         let new_offset = (offset + 1) % cb.up.size;
