@@ -16,6 +16,7 @@ use cortex_m::interrupt::Mutex;
 use cortex_m::asm;
 
 use core::fmt::{self, Write};
+use core::cmp;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -61,7 +62,7 @@ impl RTTCB {
             up: RTTUp {
                 name: 0 as *const u8,
                 buffer: 0 as *const u8,
-                size: 256,
+                size: 16,
                 wr_off: 0,
                 rd_off: 0,
                 flags: 0
@@ -69,7 +70,7 @@ impl RTTCB {
             down: RTTDown {
                 name: 0 as *const u8,
                 buffer: 0 as *const u8,
-                size: 256,
+                size: 16,
                 wr_off: 0,
                 rd_off: 0,
                 flags: 0
@@ -77,7 +78,7 @@ impl RTTCB {
         }
     }
 
-    pub fn new(upBuf: &[u8;256], downBuf: &[u8;256]) -> RTTCB {
+    pub fn new(upBuf: &[u8;16], downBuf: &[u8;16]) -> RTTCB {
         RTTCB {
             id: [0; 16],
             upBuffers: 1,
@@ -102,16 +103,19 @@ impl RTTCB {
     }
 }
 
-static RTTUpBuffer: Mutex<RefCell<[u8; 256]>> = Mutex::new(RefCell::new([0; 256]));
-static RTTDownBuffer: Mutex<RefCell<[u8; 256]>> = Mutex::new(RefCell::new([0; 256]));
+static RTTUpBuffer: Mutex<RefCell<[u8; 16]>> = Mutex::new(RefCell::new([0; 16]));
+static RTTDownBuffer: Mutex<RefCell<[u8; 16]>> = Mutex::new(RefCell::new([0; 16]));
 
 static RTTCb: Mutex<RefCell<RTTCB>> = Mutex::new(RefCell::new(RTTCB::newConst()));
 
 pub struct RTT {
+    chan: u32
 }
 
-pub fn get_chan(chan: usize) -> RTT {
-    RTT {}
+pub fn get_chan(c: u32) -> RTT {
+    RTT {
+        chan: c
+    }
 }
 
 pub fn init() {
@@ -177,7 +181,9 @@ impl fmt::Write for RTT {
             if wrap_idx >= writeable_str.len() {
                 left_str = &writeable_str;
             } else {
-                let (left_str, right_str) = writeable_str.split_at(wrap_idx);
+                let strs = writeable_str.split_at(wrap_idx);
+                left_str = strs.0;
+                right_str = strs.1;
             }
 
             let mut upBuffer = &mut (*RTTUpBuffer.borrow(cs).borrow_mut());
@@ -208,6 +214,8 @@ impl fmt::Write for RTT {
             unsafe {
                 write_volatile(offset_ref_mut, new_offset as u32);
             }
+
+            asm::dmb();
         });
 
         Ok(())
@@ -215,77 +223,165 @@ impl fmt::Write for RTT {
 
 }
 
-pub fn write_byte(b: u8) {
+impl RTT {
 
-    interrupt::free(|cs|
-    {
-        let mut cb = RTTCb.borrow(cs).borrow_mut();
+    pub fn recv_bytes(&self, out_buff: &mut [u8]) -> usize {
 
-        let offset_ref = &cb.up.wr_off;
+        let mut copy_size: usize = 0 ;
 
-        let offset = unsafe { read_volatile(offset_ref) };
-
+        interrupt::free(|cs|
         {
-            let mut upBuffer = &mut (*RTTUpBuffer.borrow(cs).borrow_mut());
+            let down = &mut RTTCb.borrow(cs).borrow_mut().down;
 
-            let dataPtr = &mut upBuffer[offset as usize];
+            let buff_size = down.size as usize;
+            let wr_offset = unsafe { read_volatile(&down.wr_off) } as usize;
+            let rd_offset = unsafe { read_volatile(&down.rd_off) } as usize;
 
-            unsafe {
-                write_volatile(dataPtr, b);
-            }
+            if wr_offset != rd_offset {
 
-            asm::dmb();
-        }
+                if rd_offset > wr_offset {
+                    
+                    let left_size = buff_size - rd_offset;
 
-        let new_offset = (offset + 1) % cb.up.size;
+                    let right_size = wr_offset;
 
-        unsafe {
-            let offset_ref_mut = &mut cb.up.wr_off;
-            write_volatile(offset_ref_mut, new_offset);
-        }
-    });
-}
+                    if right_size == 0 || out_buff.len() <= left_size {
+                        // Only copy left bytes
 
-pub fn recv_byte() -> (bool, u8) {
+                        let left_copy_size = cmp::min(left_size, out_buff.len());
 
-    let mut have_data = false;
-    let mut byte_out: u8 = 0;
+                        let downBuffer = &(*RTTDownBuffer.borrow(cs).borrow_mut());
+                        let dataPtr = &downBuffer[rd_offset];
 
-    interrupt::free(|cs|
-    {
-        let mut cb = RTTCb.borrow(cs).borrow_mut();
+                        unsafe {
+                            copy_nonoverlapping(dataPtr as *const u8, out_buff.as_mut_ptr(), left_copy_size);
+                        }
 
-        let rd_offset = cb.down.rd_off;
-        let wr_offset = cb.down.wr_off;
+                        copy_size = left_copy_size;
+                    } else {
+                        // Copying entire left side, and some right side
 
-        if rd_offset != wr_offset {
+                        let (mut out_buff_left, mut out_buff_right) = out_buff.split_at_mut(left_size);
 
-            have_data = true;
+                        let downBuffer = &(*RTTDownBuffer.borrow(cs).borrow_mut());
+                        let dataPtr = &downBuffer[rd_offset];
 
-            {
-                let rd_offset_ref = &cb.down.rd_off;
+                        unsafe {
+                            copy_nonoverlapping(dataPtr as *const u8, out_buff_left.as_mut_ptr(), left_size);
+                        }
 
-                let rd_offset = unsafe { read_volatile(rd_offset_ref) };
+                        let right_copy_size = cmp::min(right_size, out_buff_right.len());
 
-                let downBuffer = & (*RTTDownBuffer.borrow(cs).borrow_mut());
+                        let dataPtr = &downBuffer[0];
 
-                let dataPtr = &downBuffer[rd_offset as usize];
+                        unsafe {
+                            copy_nonoverlapping(dataPtr as *const u8, out_buff_right.as_mut_ptr(), right_copy_size);
+                        }
 
-                unsafe {
-                    byte_out = read_volatile(dataPtr);
+                        copy_size = left_size + right_copy_size;
+                    }
+                } else {
+
+                    let size = cmp::min(wr_offset - rd_offset, out_buff.len());
+
+                    let downBuffer = &(*RTTDownBuffer.borrow(cs).borrow_mut());
+                    let dataPtr = &downBuffer[rd_offset];
+
+                    unsafe {
+                        copy_nonoverlapping(dataPtr as *const u8, out_buff.as_mut_ptr(), size);
+                    }
+
+                    copy_size = size;
                 }
             }
 
-            let rd_offset = (rd_offset + 1) % cb.down.size;
+            asm::dmb();
 
-            let mut_rd_offset_ref = &mut cb.down.rd_off;
+            let new_rd_offset = ((rd_offset + copy_size) % buff_size) as u32;
+
+            let rd_offset_mut = &mut down.rd_off;
 
             unsafe {
-                write_volatile(mut_rd_offset_ref, rd_offset);
+                write_volatile(rd_offset_mut, new_rd_offset);
             }
-        }
-    });
 
-    (have_data, byte_out)
+            asm::dmb();
+        });
+
+        copy_size
+    }
+
+    fn write_byte(&self, b: u8) {
+        interrupt::free(|cs|
+        {
+            let mut cb = RTTCb.borrow(cs).borrow_mut();
+
+            let offset_ref = &cb.up.wr_off;
+
+            let offset = unsafe { read_volatile(offset_ref) };
+
+            {
+                let mut upBuffer = &mut (*RTTUpBuffer.borrow(cs).borrow_mut());
+
+                let dataPtr = &mut upBuffer[offset as usize];
+
+                unsafe {
+                    write_volatile(dataPtr, b);
+                }
+
+                asm::dmb();
+            }
+
+            let new_offset = (offset + 1) % cb.up.size;
+
+            unsafe {
+                let offset_ref_mut = &mut cb.up.wr_off;
+                write_volatile(offset_ref_mut, new_offset);
+            }
+        });
+    }
+
+    fn recv_byte(&self) -> (bool, u8) {
+
+        let mut have_data = false;
+        let mut byte_out: u8 = 0;
+
+        interrupt::free(|cs|
+        {
+            let mut cb = RTTCb.borrow(cs).borrow_mut();
+
+            let rd_offset = cb.down.rd_off;
+            let wr_offset = cb.down.wr_off;
+
+            if rd_offset != wr_offset {
+
+                have_data = true;
+
+                {
+                    let rd_offset_ref = &cb.down.rd_off;
+
+                    let rd_offset = unsafe { read_volatile(rd_offset_ref) };
+
+                    let downBuffer = & (*RTTDownBuffer.borrow(cs).borrow_mut());
+
+                    let dataPtr = &downBuffer[rd_offset as usize];
+
+                    unsafe {
+                        byte_out = read_volatile(dataPtr);
+                    }
+                }
+
+                let rd_offset = (rd_offset + 1) % cb.down.size;
+
+                let mut_rd_offset_ref = &mut cb.down.rd_off;
+
+                unsafe {
+                    write_volatile(mut_rd_offset_ref, rd_offset);
+                }
+            }
+        });
+
+        (have_data, byte_out)
+    }
 }
 
