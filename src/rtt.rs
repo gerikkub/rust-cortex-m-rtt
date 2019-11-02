@@ -5,8 +5,6 @@
 #![no_main]
 #![no_std]
 
-//use core::option::Option;
-
 use core::cell::RefCell;
 use core::ptr::{write_volatile, read_volatile, copy_nonoverlapping};
 use core::marker::Send;
@@ -52,6 +50,9 @@ struct RTTCB {
 
 unsafe impl Send for RTTCB {}
 
+const RTT_UP_SIZE: usize = 256;
+const RTT_DOWN_SIZE: usize = 256;
+
 impl RTTCB {
 
     pub const fn newConst() -> RTTCB {
@@ -62,7 +63,7 @@ impl RTTCB {
             up: RTTUp {
                 name: 0 as *const u8,
                 buffer: 0 as *const u8,
-                size: 16,
+                size: RTT_UP_SIZE as u32,
                 wr_off: 0,
                 rd_off: 0,
                 flags: 0
@@ -70,7 +71,7 @@ impl RTTCB {
             down: RTTDown {
                 name: 0 as *const u8,
                 buffer: 0 as *const u8,
-                size: 16,
+                size: RTT_DOWN_SIZE as u32,
                 wr_off: 0,
                 rd_off: 0,
                 flags: 0
@@ -78,7 +79,11 @@ impl RTTCB {
         }
     }
 
-    pub fn new(upBuf: &[u8;16], downBuf: &[u8;16]) -> RTTCB {
+    pub fn new(upBuf: &[u8;RTT_UP_SIZE], downBuf: &[u8;RTT_DOWN_SIZE]) -> RTTCB {
+
+        assert!(RTT_UP_SIZE <= core::u32::MAX as usize, "RTT Up size too large");
+        assert!(RTT_DOWN_SIZE <= core::u32::MAX as usize, "RTT Down size too large");
+
         RTTCB {
             id: [0; 16],
             upBuffers: 1,
@@ -103,8 +108,8 @@ impl RTTCB {
     }
 }
 
-static RTTUpBuffer: Mutex<RefCell<[u8; 16]>> = Mutex::new(RefCell::new([0; 16]));
-static RTTDownBuffer: Mutex<RefCell<[u8; 16]>> = Mutex::new(RefCell::new([0; 16]));
+static RTTUpBuffer: Mutex<RefCell<[u8; RTT_UP_SIZE]>> = Mutex::new(RefCell::new([0; RTT_UP_SIZE]));
+static RTTDownBuffer: Mutex<RefCell<[u8; RTT_DOWN_SIZE]>> = Mutex::new(RefCell::new([0; RTT_DOWN_SIZE]));
 
 static RTTCb: Mutex<RefCell<RTTCB>> = Mutex::new(RefCell::new(RTTCB::newConst()));
 
@@ -147,18 +152,21 @@ impl fmt::Write for RTT {
 
         interrupt::free(|cs|
         {
-            let mut cb = RTTCb.borrow(cs).borrow_mut();
+            let up = &mut RTTCb.borrow(cs).borrow_mut().up;
 
-            let size = cb.up.size as usize;
-            let wr_offset = unsafe { read_volatile(&cb.up.wr_off) } as usize;
-            let rd_offset = unsafe { read_volatile(&cb.up.rd_off) } as usize;
+            let buff_size = up.size as usize;
+            let wr_offset = unsafe { read_volatile(&up.wr_off) } as usize;
+            let rd_offset = unsafe { read_volatile(&up.rd_off) } as usize;
+
+            assert!(wr_offset < buff_size, "Up write offset invalid");
+            assert!(rd_offset < buff_size, "Up read offset invalid");
 
             let mut space_left = 0;
 
             if wr_offset == rd_offset {
-                space_left = size;
+                space_left = buff_size;
             } else if wr_offset > rd_offset {
-                space_left = size - (wr_offset - rd_offset);
+                space_left = buff_size - (wr_offset - rd_offset);
             } else {
                 space_left = rd_offset - wr_offset;
             }
@@ -173,7 +181,7 @@ impl fmt::Write for RTT {
                 writeable_str = &s[..space_left]
             }
 
-            let wrap_idx = (size - wr_offset) as usize;
+            let wrap_idx = (buff_size - wr_offset) as usize;
 
             let mut left_str = "";
             let mut right_str = "";
@@ -205,8 +213,8 @@ impl fmt::Write for RTT {
                 }
             }
 
-            let offset_ref_mut = &mut cb.up.wr_off;
-            let new_offset = (wr_offset + s.len()) % size;
+            let offset_ref_mut = &mut up.wr_off;
+            let new_offset = (wr_offset + s.len()) % buff_size;
 
             // Ensure all buffer writes occur before updating index
             asm::dmb();
@@ -236,6 +244,9 @@ impl RTT {
             let buff_size = down.size as usize;
             let wr_offset = unsafe { read_volatile(&down.wr_off) } as usize;
             let rd_offset = unsafe { read_volatile(&down.rd_off) } as usize;
+
+            assert!(wr_offset < buff_size, "Down write offset invalid");
+            assert!(rd_offset < buff_size, "Down write offset invalid");
 
             if wr_offset != rd_offset {
 
@@ -309,79 +320,6 @@ impl RTT {
         });
 
         copy_size
-    }
-
-    fn write_byte(&self, b: u8) {
-        interrupt::free(|cs|
-        {
-            let mut cb = RTTCb.borrow(cs).borrow_mut();
-
-            let offset_ref = &cb.up.wr_off;
-
-            let offset = unsafe { read_volatile(offset_ref) };
-
-            {
-                let mut upBuffer = &mut (*RTTUpBuffer.borrow(cs).borrow_mut());
-
-                let dataPtr = &mut upBuffer[offset as usize];
-
-                unsafe {
-                    write_volatile(dataPtr, b);
-                }
-
-                asm::dmb();
-            }
-
-            let new_offset = (offset + 1) % cb.up.size;
-
-            unsafe {
-                let offset_ref_mut = &mut cb.up.wr_off;
-                write_volatile(offset_ref_mut, new_offset);
-            }
-        });
-    }
-
-    fn recv_byte(&self) -> (bool, u8) {
-
-        let mut have_data = false;
-        let mut byte_out: u8 = 0;
-
-        interrupt::free(|cs|
-        {
-            let mut cb = RTTCb.borrow(cs).borrow_mut();
-
-            let rd_offset = cb.down.rd_off;
-            let wr_offset = cb.down.wr_off;
-
-            if rd_offset != wr_offset {
-
-                have_data = true;
-
-                {
-                    let rd_offset_ref = &cb.down.rd_off;
-
-                    let rd_offset = unsafe { read_volatile(rd_offset_ref) };
-
-                    let downBuffer = & (*RTTDownBuffer.borrow(cs).borrow_mut());
-
-                    let dataPtr = &downBuffer[rd_offset as usize];
-
-                    unsafe {
-                        byte_out = read_volatile(dataPtr);
-                    }
-                }
-
-                let rd_offset = (rd_offset + 1) % cb.down.size;
-
-                let mut_rd_offset_ref = &mut cb.down.rd_off;
-
-                unsafe {
-                    write_volatile(mut_rd_offset_ref, rd_offset);
-                }
-            }
-        });
-
-        (have_data, byte_out)
     }
 }
 
