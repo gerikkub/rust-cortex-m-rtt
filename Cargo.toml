@@ -3,6 +3,10 @@ name = "cortex-m-rtt"
 version = "0.1.0"
 authors = ["Gerik Kubiak <gerikkub@gmail.com>"]
 edition = "2018"
+description = "SEGGER RTT implementation for cortex-m microcontrollers"
+readme = "README.md"
+categories = ["embedded", "no-std"]
+keywords = ["arm", "cortex-m", "rtt"]
 
 [dependencies.cortex-m]
 version = "0.5.6"
