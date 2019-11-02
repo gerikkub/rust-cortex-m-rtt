@@ -1,5 +1,5 @@
 [package]
-name = "rtt"
+name = "cortex-m-rtt"
 version = "0.1.0"
 authors = ["Gerik Kubiak <gerikkub@gmail.com>"]
 edition = "2018"
